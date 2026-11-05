@@ -1,128 +1,183 @@
 # CVSG: Coalition Value and Synergy-Guided Multimodal Fusion for Sentiment Analysis
 
-CVSG is a supervised multimodal sentiment analysis framework combining
-linguistic, acoustic, and visual signals. Its central mechanism learns
-modality allocation and pairwise corrections from predictive coalition values.
+CVSG is a multimodal sentiment analysis framework for continuous sentiment prediction from language, acoustic, and visual signals. It learns modality allocation and pairwise interaction strength using prediction quality measured over modality coalitions.
 
-## Architecture
+## Overview
 
-- **Distributional Modality Encoding**: BERT text features and audio/visual
-  Transformer features are represented with modality-specific Gaussian
-  bottlenecks. Token-level representations are pooled into modality features,
-  alongside posterior-scale descriptors.
-- **Value and Synergy Fusion**: learned utility predictors allocate modality
-  content, while predicted pair gains control feature interaction proposals.
-  Their combination passes through residual fusion and a fused Gaussian
-  bottleneck to produce continuous sentiment predictions.
-- **Coalition Value Supervision**: during training, a shared auxiliary head
-  evaluates seven nonempty modality subsets. Prediction-loss-derived Shapley
-  marginal contributions and second-order pair differences supervise the
-  utility and pair-gain estimators. The coalition branch is not required
-  for standard inference.
+CVSG consists of three modules:
 
-## Repository structure
+1. **Distributional Modality Encoding**: encodes language, acoustic, and visual sequences and constructs modality-specific Gaussian representations. Pooled modality features and posterior-scale descriptors are passed to the fusion module.
+2. **Value and Synergy Fusion**: predicts modality utilities for content allocation and pairwise gains for interaction correction. The fused representation is processed by a Gaussian bottleneck and a sentiment prediction head.
+3. **Coalition Value Supervision**: during training, evaluates all seven nonempty modality subsets. Their supervised prediction losses define marginal-utility and pair-gain targets for the fusion predictors. This auxiliary branch is not needed for ordinary inference.
+
+## Project structure
 
 ```text
 CVSG/
-├── main.py                 # Training, validation, evaluation, checkpoints
-├── model.py                # CVSG neural network and auxiliary objectives
-├── global_configs.py      # Input feature dimensions and device defaults
-├── modules/                # Attention and positional encoding components
-├── datasets/README.md     # Input data format
-├── requirements.txt       # Python dependencies
-├── checkpoints/            # Saved checkpoints (excluded from Git)
-├── results/                # Experiment outputs (excluded from Git)
-└── THIRD_PARTY_NOTICES.md # Source and dependency provenance
+├── main.py                      # Training, validation, testing, and checkpoints
+├── model.py                     # CVSG model and learning objectives
+├── global_configs.py           # Feature dimensions and device defaults
+├── requirements.txt            # Python dependencies
+├── modules/
+│   ├── __init__.py
+│   ├── transformer.py
+│   ├── multihead_attention.py
+│   └── position_embedding.py
+├── scripts/
+│   ├── check_dataset.py
+│   └── run_five_seeds.py
+├── datasets/
+│   ├── README.md
+│   ├── mosi.pkl                 # Download separately; not included
+│   └── mosei.pkl                # Download separately; not included
+├── bert-base-uncased/           # Download separately; not included
+├── checkpoints/                # Created by training
+└── results/                    # Logs and multi-seed summaries
 ```
 
-## Requirements and setup
+## 1. Environment setup
 
-Python 3.10–3.11 and a compatible PyTorch installation are recommended.
-For GPU use, install a PyTorch build matching your CUDA runtime, then run:
+Python 3.10 or 3.11 is recommended. For GPU training, first install a PyTorch build compatible with the installed CUDA driver, following the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
+
+Install the remaining requirements from the repository root:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-Prepare a local `bert-base-uncased/` directory containing configuration,
-tokenizer, and pretrained weights, or allow the model files to be retrieved
-through your configured Hugging Face environment. BERT weights are not
-included in this repository.
+## 2. Download the CMU-MOSI and CMU-MOSEI datasets
 
-Place `mosi.pkl` or `mosei.pkl` under `datasets/` in the format described
-in `datasets/README.md`. The datasets are not included in this repository.
+CVSG expects **word-aligned** multimodal examples in Python `.pkl` files. The supported data format and a public download script are available at:
 
-## Training
+- Dataset download script: https://github.com/WasifurRahman/BERT_multimodal_transformer/blob/master/datasets/download_datasets.sh
+- CMU-MOSI dataset information: https://multicomp.cs.cmu.edu/resources/cmu-mosi-dataset/
+- CMU-MOSEI dataset information: https://multicomp.cs.cmu.edu/resources/cmu-mosei-dataset/
+- CMU Multimodal Data SDK: https://github.com/CMU-MultiComp-Lab/CMU-MultimodalSDK
 
-```bash
-# CMU-MOSI
-python main.py --dataset mosi --gpu 0 --seed 0 --n_epochs 50 --bert_path ./bert-base-uncased
+### Option A: Download preprocessed `.pkl` files
 
-# CMU-MOSEI
-python main.py --dataset mosei --gpu 0 --seed 0 --n_epochs 50 --train_batch_size 128 --bert_path ./bert-base-uncased
-```
-
-Run additional seeds independently and report mean and standard deviation
-across completed runs. The default checkpoint is chosen using minimum
-validation MSE; `--select_metric mae` switches checkpoint selection to
-minimum validation MAE. The held-out test set is evaluated after training
-by default.
-
-## Evaluation
+Run these commands from the **CVSG repository root**:
 
 ```bash
-python main.py --dataset mosi --gpu 0 --seed 0 --eval_only
+python -m pip install gdown
+mkdir -p datasets
+gdown "https://drive.google.com/uc?id=12HbavGOtoVCqicvSYWl3zImli5Jz0Nou" -O datasets/mosi.pkl
+gdown "https://drive.google.com/uc?id=1VJhSc2TGrPU8zJSVTYwn5kfuG47VaNQ3" -O datasets/mosei.pkl
 ```
 
-The evaluation process reads the saved checkpoint for the corresponding
-model configuration and seed. Metrics include Acc-2, support-weighted F1,
-Acc-7, MAE, Corr, and MSE. Acc-2 and F1 exclude samples with exactly zero
-ground-truth sentiment unless `--include_zero` is specified.
+The Google Drive IDs above come from the public dataset download script. If an ID is unavailable or its access permissions change, use the script's alternate download links. A raw CMU SDK download is **not** directly interchangeable with the required preprocessed `.pkl` format; additional preprocessing and matching train/validation/test splits would be necessary.
 
-## Available training variants
+On Windows PowerShell, create the folder with `New-Item -ItemType Directory -Force datasets` instead of `mkdir -p datasets`.
 
-The following options are implemented as CLI switches:
+### Expected data structure
 
-```bash
---disable_coalition            # Disable coalition-based training objectives
---disable_value                # Use uniform modality allocation
---disable_synergy              # Disable pair corrections
---disable_uncertainty          # Remove scale descriptors
---disable_synergy_supervision  # Disable direct pair-gain supervision
---kl_weight 0.001
---coalition_weight 0.08
---value_weight 0.04
---synergy_weight 0.02
---utility_temperature 1.5
---pair_strength 0.65
+The loader expects a dictionary of splits, where each sample is:
+
+```python
+((words, visual_features, acoustic_features), sentiment_score, sample_id)
 ```
 
-These switches do not implement every comparison from the manuscript.
-In particular, scale-only routing, a constant pair gate, and uniform
-pair strength require separate controlled implementations before they
-can be reported as reproducible ablations.
+For example:
 
-## Experimental integrity
+```python
+{
+    "train": [((words, visual, acoustic), label, sample_id), ...],
+    "dev":   [((words, visual, acoustic), label, sample_id), ...],
+    "test":  [((words, visual, acoustic), label, sample_id), ...],
+}
+```
 
-- Choose checkpoints with validation metrics, not test metrics.
-- Use exactly the same preprocessing, seeds, and hyperparameters when
-  comparing model variants.
-- Do not present a logged result as reproduced unless the dataset,
-  pretrained weights, and runtime configuration are recorded.
-- This package has been checked for Python syntax and source consistency;
-  complete benchmark training has not been independently verified here.
+`words` must be a list of word tokens, and acoustic/visual feature arrays must be aligned to those tokens. A `valid` split is also accepted in place of `dev`. Sentiment targets lie in `[-3, 3]`.
 
-## Dataset and code permissions
-
-External datasets, model weights, and third-party components have their
-own redistribution terms. See `THIRD_PARTY_NOTICES.md` before publishing.
-
-
-## Multiple-seed evaluation and data validation
+Check that the files were downloaded correctly:
 
 ```bash
 python scripts/check_dataset.py datasets/mosi.pkl
-python scripts/run_five_seeds.py --dataset mosi --gpu 0 --n_epochs 50 --bert_path ./bert-base-uncased
+python scripts/check_dataset.py datasets/mosei.pkl
 ```
 
-These scripts do not supply datasets, pretrained weights, or unimplemented ablation configurations.
+Dataset `.pkl` files are not distributed in this repository. Only load pickle files from sources you trust.
+
+## 3. Download pretrained BERT
+
+The language encoder uses **bert-base-uncased**. Official model page:
+
+https://huggingface.co/google-bert/bert-base-uncased
+
+To download the tokenizer, configuration, and pretrained weights into `./bert-base-uncased/`, run the following from the repository root:
+
+```bash
+python -c "from transformers import BertTokenizer, BertModel; repo='google-bert/bert-base-uncased'; BertTokenizer.from_pretrained(repo).save_pretrained('bert-base-uncased'); BertModel.from_pretrained(repo).save_pretrained('bert-base-uncased')"
+```
+
+After downloading, the directory should contain files such as:
+
+```text
+bert-base-uncased/
+├── config.json
+├── pytorch_model.bin
+├── vocab.txt
+└── tokenizer_config.json
+```
+
+An internet connection is required for the initial download. This model directory is excluded from Git by `.gitignore` and is not included in the source archive.
+
+## 4. Training
+
+Run the following commands from the repository root, after preparing the datasets and BERT files.
+
+### CMU-MOSI
+
+```bash
+python main.py --dataset mosi --gpu 0 --seed 0 --n_epochs 50 --bert_path ./bert-base-uncased
+```
+
+### CMU-MOSEI
+
+```bash
+python main.py --dataset mosei --gpu 0 --seed 0 --n_epochs 50 --train_batch_size 128 --bert_path ./bert-base-uncased
+```
+
+`--gpu 0` selects the first visible GPU. For CPU execution, use `--gpu -1` (substantially slower). The default learning rates are `1e-5` for BERT and `2e-5` for the other model parameters.
+
+Best checkpoints are selected by **minimum validation MSE**, not by test accuracy or test F1. Standard training evaluates the held-out test set after training is complete.
+
+## 5. Evaluate a saved checkpoint
+
+```bash
+python main.py --dataset mosi --gpu 0 --seed 0 --eval_only
+python main.py --dataset mosei --gpu 0 --seed 0 --eval_only
+```
+
+The matching checkpoint must be present under `checkpoints/`. To load another checkpoint explicitly, add `--checkpoint /path/to/checkpoint.pth`.
+
+Reported metrics include Acc-2, support-weighted F1, Acc-7, MAE, Pearson correlation (Corr), and MSE. By default, Acc-2 and F1 exclude examples whose ground-truth sentiment is exactly zero; `--include_zero` changes this convention.
+
+## 6. Five-seed evaluation
+
+The included script runs seeds `0`, `54`, `58`, `101`, and `2334` by default, and writes per-seed logs and a mean/standard-deviation JSON summary to `results/`.
+
+```bash
+python scripts/run_five_seeds.py --dataset mosi --gpu 0 --n_epochs 50 --bert_path ./bert-base-uncased
+python scripts/run_five_seeds.py --dataset mosei --gpu 0 --n_epochs 50 --train_batch_size 128 --bert_path ./bert-base-uncased
+```
+
+## 7. Available ablation switches
+
+```bash
+--disable_coalition             # Remove coalition-based auxiliary objectives
+--disable_value                 # Use uniform modality allocation
+--disable_synergy               # Remove pairwise correction contributions
+--disable_uncertainty           # Remove posterior-scale descriptors
+--disable_synergy_supervision   # Disable direct pair-gain target supervision
+```
+
+Additional weighting arguments are available through `python main.py --help`. These switches cover only implemented variants; they do not reproduce every possible ablation setting.
+
+## Reproducibility notes
+
+- Keep the same dataset splits, feature processing, model settings, and evaluation convention when comparing experiments.
+- Select checkpoints using validation metrics only.
+- Record the random seeds, library versions, and data source used for each run.
+- Model weights and datasets are not bundled in this repository.
+- Source-code checks do not substitute for a complete independent GPU training run.
