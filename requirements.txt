@@ -1,0 +1,7 @@
+# Install the PyTorch build appropriate for your CPU/CUDA environment.
+# Python 3.10–3.11 is recommended.
+torch>=2.1,<2.6
+transformers>=4.30,<4.45
+numpy>=1.23,<2.0
+scikit-learn>=1.2,<1.7
+tqdm>=4.64,<5.0
