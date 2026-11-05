@@ -151,24 +151,3 @@ python main.py --dataset mosei --gpu 0 --seed 0 --eval_only
 The matching checkpoint must be present under `checkpoints/`. To load another checkpoint explicitly, add `--checkpoint /path/to/checkpoint.pth`.
 
 Reported metrics include Acc-2, support-weighted F1, Acc-7, MAE, Pearson correlation (Corr), and MSE. By default, Acc-2 and F1 exclude examples whose ground-truth sentiment is exactly zero; `--include_zero` changes this convention.
-
-
-## 6. Available ablation switches
-
-```bash
---disable_coalition             # Remove coalition-based auxiliary objectives
---disable_value                 # Use uniform modality allocation
---disable_synergy               # Remove pairwise correction contributions
---disable_uncertainty           # Remove posterior-scale descriptors
---disable_synergy_supervision   # Disable direct pair-gain target supervision
-```
-
-Additional weighting arguments are available through `python main.py --help`. These switches cover only implemented variants; they do not reproduce every possible ablation setting.
-
-## Reproducibility notes
-
-- Keep the same dataset splits, feature processing, model settings, and evaluation convention when comparing experiments.
-- Select checkpoints using validation metrics only.
-- Record the random seeds, library versions, and data source used for each run.
-- Model weights and datasets are not bundled in this repository.
-- Source-code checks do not substitute for a complete independent GPU training run.
