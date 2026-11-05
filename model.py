@@ -1,9 +1,31 @@
 """CVSG: Coalition Value and Synergy-Guided Multimodal Fusion.
 
-Three modality-specific Gaussian encoders provide pooled representations and
-posterior-scale descriptors. Coalition-based training targets supervise
-feature-conditioned utility scores and pairwise interaction gains. The
-inference path uses the learned utility and gain predictors without labels.
+The network predicts continuous sentiment from word-aligned text, audio and
+visual sequences. It combines distributional modality encoding with learned
+contribution-based allocation and pairwise interaction corrections.
+
+Organization
+------------
+CVSGTextEncoder: contextual text representations followed by convolution.
+CoalitionValueSynergyFusion: feature-conditioned modality values, pair
+    proposals, bounded interaction gains, and training-time subset targets.
+CVSGFusion: unimodal and fused Gaussian parameterization, sampling,
+    regularization, and joint task supervision.
+CVSGModel: the application-facing network coupling language, acoustic and
+    visual feature extraction to the Gaussian fusion module.
+
+Training versus inference
+-------------------------
+The seven nonempty coalitions are evaluated only in the supervised branch.
+Their losses produce detached utility and pair-gain targets during training.
+At inference, the fusion path uses its learned predictors without labels,
+subset enumeration or coalition losses.
+
+Compatibility
+-------------
+This documented release retains the existing layer names, tensor operations,
+sampling sites, loss coefficients, defaults, and forward-method interfaces.
+This is a documentation expansion, not a modification of the algorithm.
 """
 import logging
 import math
@@ -24,18 +46,69 @@ MODEL_NAME = 'Coalition Value and Synergy-Guided Multimodal Fusion'
 ACT2FN = {'gelu': gelu, 'relu': F.relu, 'swish': _ACT2FN['swish'], 'gelu_new': gelu_new}
 
 def _mask_pool(x,mask):
+    """Compute a masked temporal mean without introducing trainable parameters.
+
+    Args:
+        x: Token representations of shape [batch, time, feature_width].
+        mask: Valid-position indicators of shape [batch, time], or None.
+
+    Returns:
+        Per-utterance feature means of shape [batch, feature_width].
+
+    Mask handling:
+        The denominator is clamped to at least one valid position. A missing
+        mask falls back to an ordinary mean along the temporal dimension.
+        Padding values are excluded by zeroing their multiplicative weights.
+    """
     if mask is None: return x.mean(1)
     w=mask[:, :x.size(1)].to(x.dtype).unsqueeze(-1)
     return (x*w).sum(1)/w.sum(1).clamp_min(1.)
 
 def _av_mask(mask):
+    """Build the temporal validity mask for audio and visual features.
+
+    The language mask includes special tokens; the nonverbal features aligned
+    with those tokens should normally be excluded from pooling and KL terms.
+    For each sample, positions strictly between the first and last valid token
+    are retained. A short sequence with at most two valid tokens falls back
+    to its first position so downstream masked means remain defined.
+
+    Args:
+        mask: Language valid-token mask [batch, time].
+    Returns:
+        Boolean nonverbal validity mask [batch, time].
+    """
     n=mask.long().sum(-1,keepdim=True)
     s=torch.arange(mask.size(1),device=mask.device).unsqueeze(0)
     m=(s>0)&(s<(n-1))
     return m | ((n<=2)&(s==0))
 
 class CVSGTextEncoder(BertPreTrainedModel):
+    """Encode the language stream with contextual BERT features and convolution.
+
+    This component follows the same forward signature expected by the model's
+    pretrained-language loading path. Text is first converted into contextual
+    embeddings. A temporal convolution maps the BERT hidden width to the
+    shared multimodal width used by the audio and visual encoders.
+
+    The model returns both a terminal temporal feature and the full projected
+    sequence. CVSG uses the projected sequence for Gaussian token encoding.
+    The terminal feature remains available for interface compatibility.
+
+    The encoder owns its embedding and Transformer parameters so that the
+    training script can assign it a separate learning rate if desired.
+    """
     def __init__(self, config, multimodal_config, d_l):
+        """Initialize language embeddings, Transformer layers, and temporal projection.
+
+        Args:
+            config: Hugging Face configuration with attention and embedding sizes.
+            multimodal_config: Retained constructor argument for model integration.
+            d_l: Shared latent width after the temporal convolution.
+
+        The convolution keeps sequence length constant with kernel size three,
+        stride one, and padding one. Standard module initialization is preserved.
+        """
         super().__init__(config)
         self.config = config
 
@@ -48,15 +121,32 @@ class CVSGTextEncoder(BertPreTrainedModel):
         self.init_weights()
 
     def get_input_embeddings(self):
+        """Expose the token embedding matrix to pretrained-model utilities.
+
+        The returned embedding layer is the same object used during forward.
+        This method provides the standard integration point for resizing or
+        inspecting a vocabulary's learned input representations.
+        """
         return self.embeddings.word_embeddings
 
     def set_input_embeddings(self, value):
+        """Replace the token embedding layer without changing the encoder interface.
+
+        Args:
+            value: Replacement torch.nn.Embedding-compatible module.
+
+        This setter does not touch the temporal projection or attention layers.
+        """
         self.embeddings.word_embeddings = value
 
     def _prune_heads(self, heads_to_prune):
-        """ Prunes heads of the model.
-            heads_to_prune: dict of {layer_num: list of heads to prune in this layer}
-            See base class PreTrainedModel
+        """Remove selected attention heads from language encoder layers.
+
+        Args:
+            heads_to_prune: Mapping from layer index to head indices.
+
+        Pruning is implemented by the existing attention-layer method. Ordinary
+        training does not call this method; it remains an optional model utility.
         """
         for layer, heads in heads_to_prune.items():
             self.encoder.layer[layer].attention.prune_heads(heads)
@@ -76,7 +166,30 @@ class CVSGTextEncoder(BertPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
     ):
-        """Return projected text features and the sequence representation."""
+        """Produce projected language features from BERT token sequences.
+
+        Args:
+            input_ids: Token indices [batch, sequence_length].
+            attention_mask: Optional valid-token indicators.
+            token_type_ids: Optional sentence-segment indices.
+            position_ids: Optional explicit positional indices.
+            head_mask: Optional Transformer attention-head mask.
+            inputs_embeds: Alternate embeddings; exclusive with input_ids.
+            encoder_hidden_states: Optional cross-attention states for decoder mode.
+            encoder_attention_mask: Optional mask for those decoder states.
+            output_attentions: Optional attention reporting flag.
+            output_hidden_states: Optional intermediate-state reporting flag.
+
+        Returns:
+            Tuple of a terminal projected feature and projected sequence output.
+            The sequence is [batch, latent_width, sequence_length] to match the
+            downstream CVSG multimodal feature interface.
+
+        Operational detail:
+            Attention masking and encoder flags follow the Hugging Face contract.
+            The convolution is applied after contextualization and does not alter
+            the length of the token sequence.
+        """
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -182,11 +295,23 @@ class CVSGTextEncoder(BertPreTrainedModel):
 
 
 class CoalitionValueSynergyFusion(nn.Module):
-    """Active fusion path: 7 train-only coalition heads + value-guided full fusion.
+    """Predict modality utility and pairwise gains from input-dependent features.
 
-    Predictive coalition values are defined in supervised *loss* space; they are
-    neither Shapley causal attributions nor mutual-information estimates.
-    Labels are used ONLY to form detached training targets, never at inference.
+    The full inference path first constructs projected modality content.
+    Value predictors condition on content, global context, and scale proxies.
+    Their scores determine a smoothed softmax allocation across three sources.
+    Pair proposal networks produce signed corrections from source content,
+    while pair-gain networks estimate bounded interaction-control scores.
+
+    During supervised training, seven auxiliary subset predictions are formed.
+    Their negative smooth-L1 losses define a coalition-quality function.
+    Three-player Shapley differences create value targets, and second-order
+    subset differences create targets for the pair-gain networks.
+
+    These quality-derived targets are detached from the prediction graph.
+    They are supervisory signals, not features consumed at inference time.
+    The pairwise gates are nonnegative; the signed correction direction is
+    determined by each learned pair proposal, not by the gate itself.
     """
     PAIRS=((0,1),(0,2),(1,2))
                                                                         
@@ -194,6 +319,20 @@ class CoalitionValueSynergyFusion(nn.Module):
                 (1,1,0),(1,0,1),(0,1,1),(1,1,1))
 
     def __init__(self,dim):
+        """Construct all predictors used by content routing and pair corrections.
+
+        Args:
+            dim: Feature width shared by the three modality representations.
+
+        The module preserves the exact three pair indices (text/audio, text/visual,
+        audio/visual) and the enumeration of seven nonempty coalitions. Each pair
+        owns an independent proposal and gain-predictor network. A single auxiliary
+        head is shared across all subset predictions to place their quality scores
+        on the same supervised loss scale.
+
+        Gain-output biases start at zero. That initialization is important for
+        retaining the original pair-gate behavior at the start of training.
+        """
         super().__init__()
         self.dim=dim
         self.modality_proj=nn.ModuleList([
@@ -221,10 +360,22 @@ class CoalitionValueSynergyFusion(nn.Module):
 
     @staticmethod
     def shapley_targets(quality):
-        """Exact 3-player Shapley formula on DETACHED supervised loss quality.
+        """Compute exact marginal-value targets for the three-modality coalition game.
 
-        quality keys are 3-bit integer subset masks; 0 is neutral-score baseline.
-        The target uses the training label but is never used as a forward input.
+        Args:
+            quality: Dictionary of batchwise supervised quality tensors keyed by
+                integer subset bit masks. Bit 0 denotes text, bit 1 audio, and bit
+                2 vision. Key zero is the prediction-zero reference quality.
+
+        Returns:
+            Tensor of three marginal contributions for each sample, ordered by
+            text, audio, and vision. The trailing singleton dimension is retained.
+
+        Computation:
+            Every modality joins all four coalitions formed by the other two.
+            Contributions use coefficients 1/3, 1/6, 1/6, and 1/3 according to
+            coalition size. Targets have no gradient path to subset predictions,
+            because their quality entries are detached before aggregation.
         """
         values=[]
         factorial={0:1/3,1:1/6,2:1/3}
@@ -241,6 +392,50 @@ class CoalitionValueSynergyFusion(nn.Module):
                 use_synergy=True, use_uncertainty=True,
                 use_coalition=True, synergy_supervision=True,
                 utility_temp=1.5, pair_strength=.65):
+        """Fuse three pooled Gaussian features and optionally supervise their utility.
+
+        Args:
+            pooled: Sequence of text, audio, and visual tensors [batch, dim].
+            logvar: Batchwise [batch, 3] log-scale descriptors.
+            labels: Optional continuous sentiment targets, used only for training.
+            use_value: Whether learned value scores determine allocation weights.
+            use_synergy: Whether pair-proposal corrections are added to content.
+            use_uncertainty: Whether relative scale enters contribution predictors.
+            use_coalition: Whether to evaluate supervised subset quality targets.
+            synergy_supervision: Whether gain predictors fit pairwise targets.
+            utility_temp: Temperature of the value-score softmax allocation.
+            pair_strength: Residual scale on the output pair-correction pathway.
+
+        Returns:
+            full: Fused utterance-level representation [batch, dim].
+            reg: Either scalar zero or coalition, value, and pair-target losses.
+            diagnostic: Detached routing, utility scores, and synergy gain scores.
+
+        Full-view content:
+            A learned modality projection first produces comparable content vectors.
+            A global mean context is given to every utility predictor. Centered,
+            clipped negative log-variance values supply relative scale features.
+            Softmax routing is mixed with uniform weights to avoid fully ignoring
+            any active modality; the original mixing coefficient is 0.2.
+
+        Pair correction:
+            Each proposal receives two modality vectors and their product. Its
+            gain predictor additionally receives the pair's scale descriptors.
+            Pairwise contributions are gated by sigmoid(gain) and the geometric
+            mean of the learned modality allocations. A learned output mapping,
+            fixed residual scaling, and final layer normalization complete fusion.
+
+        Coalition supervision:
+            Subsets use scale-conditioned weighting and only their included pairs.
+            The same auxiliary head predicts each subset's continuous sentiment.
+            Negative samplewise smooth-L1 losses define detached coalition values.
+            Shapley utility targets and pair-gain differences supervise their
+            respective prediction networks via smooth-L1 losses.
+
+        Evaluation:
+            Passing labels=None bypasses coalition enumeration entirely. The
+            learned allocation and pair-correction pathways remain active.
+        """
         B=pooled[0].size(0)
         device,dtype=pooled[0].device,pooled[0].dtype
         h=[p(e) for p,e in zip(self.modality_proj,pooled)]
@@ -323,8 +518,29 @@ class CoalitionValueSynergyFusion(nn.Module):
 
 
 class CVSGFusion(nn.Module):
-    """Gaussian encoding, coalition supervision, and full-view sentiment prediction."""
+    """Coordinate distributional encoding and supervised coalition-guided fusion.
+
+    This module owns token-level Gaussian parameter networks for the three
+    modalities and a separate Gaussian bottleneck for the fused representation.
+    Mean pooling over valid temporal positions creates utterance descriptors,
+    and averaged token variances generate one log-scale per modality.
+
+    The coalition module supplies a full-view feature representation and, in
+    training, the auxiliary losses for subset prediction, utility matching, and
+    pair-gain matching. The final linear head regresses the sentiment score.
+    A Gaussian prior KL loss regularizes token and fused posteriors.
+    """
     def __init__(self,num_latents,dim):
+        """Initialize four Gaussian parameterization networks and the fusion head.
+
+        Args:
+            num_latents: Retained constructor parameter for the model interface.
+            dim: Common token, pooled, and fused latent feature width.
+
+        The separate Gaussian heads share architectural dimensions but do not
+        share trainable weights. Network names are retained to preserve checkpoint
+        compatibility and the mapping of parameter tensors in state_dict().
+        """
         super().__init__()
         self.d_l=dim
         self.encoder_l=nn.Sequential(nn.Linear(dim,1024),nn.ReLU())
@@ -340,6 +556,12 @@ class CVSGFusion(nn.Module):
         self.configure_training_options()
 
     def reset_pair_gain_bias(self):
+        """Restore zero initial pair-gain output biases after model initialization.
+
+        The enclosing model initializes its trainable parameters and then invokes
+        this method to enforce the intended neutral initial pair-gain prediction.
+        It changes only biases of the last linear layer in each pair-gain network.
+        """
         for mod in self.fusion1.pair_gain:
             nn.init.zeros_(mod[-1].bias)
 
@@ -349,6 +571,26 @@ class CVSGFusion(nn.Module):
                           coalition_weight=.08,value_weight=.04,
                           synergy_weight=.02,utility_temperature=1.5,
                           pair_strength=.65,deterministic_eval=True,clip_eval=True):
+        """Set runtime and ablation switches without replacing any learned modules.
+
+        Args:
+            disable_coalition: Disable training-only supervised subset objectives.
+            disable_value: Use uniform instead of learned modality allocation.
+            disable_synergy: Remove pairwise correction from fusion.
+            disable_uncertainty: Zero the input log-scale descriptors before fusion.
+            disable_synergy_supervision: Omit pair-gain target matching.
+            kl_weight: Coefficient of Gaussian prior regularization.
+            coalition_weight: Weight of seven-subset prediction loss.
+            value_weight: Weight of marginal-utility target matching.
+            synergy_weight: Weight of pair-gain target matching.
+            utility_temperature: Allocation-softmax temperature.
+            pair_strength: Pair residual correction strength.
+            deterministic_eval: Use posterior means in evaluation when enabled.
+            clip_eval: Clamp evaluation predictions to the annotated score range.
+
+        This method is intentionally parameter-free. It changes only Python-side
+        control attributes so saved model tensor names remain stable across runs.
+        """
         self.use_coalition=not bool(disable_coalition)
         self.use_value=not bool(disable_value)
         self.use_synergy=not bool(disable_synergy)
@@ -364,24 +606,106 @@ class CVSGFusion(nn.Module):
         self.clip_eval=bool(clip_eval)
 
     def encode_l(self,x):
+        """Parameterize language token Gaussian means and standard deviations.
+
+        Args:
+            x: Contextual language tokens with shape [batch, time, dim].
+        Returns:
+            Two tensors [batch, time, dim] for mean and positive scale.
+        """
         h=self.encoder_l(x);return self.fc_mu_l(h),F.softplus(self.fc_std_l(h)-5.)+1e-5
     def encode_a(self,x):
+        """Parameterize acoustic token Gaussian means and standard deviations.
+
+        The acoustic encoder owns its own hidden projection and parameter heads.
+        Its output shape matches that of the language token Gaussian parameters.
+        """
         h=self.encoder_a(x);return self.fc_mu_a(h),F.softplus(self.fc_std_a(h)-5.)+1e-5
     def encode_v(self,x):
+        """Parameterize visual token Gaussian means and standard deviations.
+
+        Visual feature parameters are independent of the language and audio
+        Gaussian heads, even though their output latent width is identical.
+        """
         h=self.encoder_v(x);return self.fc_mu_v(h),F.softplus(self.fc_std_v(h)-5.)+1e-5
     def encode(self,x):
+        """Parameterize the final Gaussian posterior over the fused representation.
+
+        This is distinct from the three token-level Gaussian heads. It receives
+        a single utterance-level feature and returns fused mean and scale vectors.
+        """
         h=self.encoder(x);return self.fc_mu(h),F.softplus(self.fc_std(h)-5.)+1e-5
     @staticmethod
     def reparameterise(mu,std,stochastic=True):
+        """Obtain a Gaussian latent sample or its posterior mean.
+
+        Args:
+            mu: Posterior mean tensor.
+            std: Posterior standard deviation tensor, same shape as mu.
+            stochastic: Draw a standard-normal tensor when True; otherwise use mu.
+        Returns:
+            Sampled or deterministic latent tensor without shape changes.
+
+        The random draw location and sample count are preserved for reproducibility.
+        """
         return mu+std*torch.randn_like(std) if stochastic else mu
     @staticmethod
     def _kl(mu,std,mask=None):
+        """Compute diagonal-Gaussian KL divergence to a standard normal prior.
+
+        Args:
+            mu: Per-position means or utterance-level fused means.
+            std: Matching positive standard deviations.
+            mask: Optional validity mask for a temporal Gaussian representation.
+
+        Returns:
+            A scalar mean divergence, with invalid time positions excluded
+            whenever a temporal mask is provided.
+
+        The formula is one half of mu^2 + std^2 - 2 log(std) - 1.
+        The denominator counts valid token-coordinate pairs, not padded entries.
+        The fused representation uses the unmasked scalar mean form.
+        """
         kl=.5*(mu.square()+std.square()-2*torch.log(std.clamp_min(1e-6))-1)
         if mask is None:return kl.mean()
         w=mask.to(kl.dtype).unsqueeze(-1)
         return (kl*w).sum()/(w.sum()*kl.size(-1)).clamp_min(1.)
     def forward(self,x_l,x_a,x_v,x_l_2D=None,x_a_2D=None,x_v_2D=None,
                 label_ids=None,attention_mask=None):
+        """Compute the full CVSG sentiment prediction and joint training loss.
+
+        Args:
+            x_l: Language features [batch, time, dim].
+            x_a: Acoustic features [batch, time, dim].
+            x_v: Visual features [batch, time, dim].
+            x_l_2D, x_a_2D, x_v_2D: Retained unused interface arguments.
+            label_ids: Optional continuous supervision for the current batch.
+            attention_mask: Language validity mask [batch, time].
+
+        Returns:
+            pred: Continuous sentiment prediction [batch, 1].
+            loss: Scalar task plus auxiliary regularization objective when labeled.
+
+        Distributional encoding:
+            Language uses the ordinary attention mask. Acoustic and visual
+            streams exclude the first and terminal special-token positions.
+            Token latents are sampled during training; in deterministic evaluation,
+            posterior means replace Gaussian samples in both encoding stages.
+            Masked utterance means provide the three inputs to coalition fusion.
+            Token posterior variances generate relative scale descriptors.
+
+        Full-view prediction:
+            The fusion block performs utility-weighted content aggregation and
+            optionally incorporates signed pairwise residual corrections. Its
+            output enters an independent fused Gaussian bottleneck, followed by
+            a linear sentiment regressor. Clipping is an evaluation-only option.
+
+        Objective:
+            Absolute, smooth-L1, and squared regression errors train prediction.
+            During training, coalition supervision supplies the three auxiliary
+            objectives. Gaussian prior KL terms regularize the unimodal and fused
+            distributions. All existing coefficients and their order are retained.
+        """
         if attention_mask is None:
             attention_mask=torch.ones(x_l.shape[:2],device=x_l.device,dtype=torch.bool)
         mask=attention_mask.bool()
@@ -422,12 +746,38 @@ class CVSGFusion(nn.Module):
         return pred,loss
 
     def test(self,x_l,x_a,x_v,attention_mask=None):
+        """Run the final inference path without coalition training targets.
+
+        Args:
+            x_l, x_a, x_v: Encoded modality sequences.
+            attention_mask: Valid text positions, used to derive nonverbal masks.
+        Returns:
+            Batchwise sentiment prediction tensor without auxiliary losses.
+        """
         return self.forward(x_l,x_a,x_v,None,None,None,None,attention_mask)[0]
 
 
 class CVSGModel(BertPreTrainedModel):
-    """Multimodal encoder and coalition-guided fusion network."""
+    """End-to-end CVSG model for word-aligned multimodal sentiment regression.
+
+    The language stream is contextualized using the pretrained text encoder.
+    Acoustic and visual features receive independent temporal convolution and
+    Transformer encoding. Each stream is mapped to the same latent width and
+    passed into the Gaussian coalition-guided fusion network.
+
+    During training, return_loss=True additionally computes task and auxiliary
+    objectives. In standard inference, the model emits only predictions.
+    """
     def __init__(self,config,multimodal_config):
+        """Construct the language, acoustic, visual, and fusion submodules.
+
+        Args:
+            config: Pretrained language encoder configuration.
+            multimodal_config: Retained multimodal settings container.
+
+        Explicit gain-bias reset after pretrained-model initialization preserves
+        the existing initial condition of the pairwise gain networks.
+        """
         super().__init__(config)
         self.num_labels=config.num_labels
         self.d_l=50
@@ -441,12 +791,38 @@ class CVSGModel(BertPreTrainedModel):
         self.init_weights()
         self.fusion.reset_pair_gain_bias()
     def get_network(self,self_type='l',layers=3):
+        """Build a temporal Transformer block for acoustic or visual encoding.
+
+        Args:
+            self_type: Retained network-selection identifier.
+            layers: Number of Transformer encoder layers.
+        Returns:
+            TransformerEncoder initialized with unchanged dropout settings.
+        """
         return TransformerEncoder(embed_dim=self.d_l,num_heads=5,layers=layers,
                     attn_dropout=self.attn_dropout,relu_dropout=.3,res_dropout=.3,
                     embed_dropout=.2,attn_mask=False)
     def _get_features(self,input_ids,visual,acoustic,attention_mask,token_type_ids=None,
                     position_ids=None,head_mask=None,inputs_embeds=None,
                     output_attentions=None,output_hidden_states=None):
+        """Extract temporally aligned modality features before Gaussian encoding.
+
+        Args:
+            input_ids: Batchwise token indices for language.
+            visual: Word-aligned visual sequence features.
+            acoustic: Word-aligned acoustic sequence features.
+            attention_mask: Valid language token positions.
+            token_type_ids: Optional language segment indices.
+            position_ids: Optional language position indices.
+            head_mask: Optional language attention-head mask.
+            inputs_embeds: Optional direct language embeddings.
+            output_attentions: Optional language attention reporting flag.
+            output_hidden_states: Optional language intermediate-state flag.
+
+        Returns:
+            Tuple of aligned language, acoustic, and visual token embeddings,
+            each shaped [batch, time, latent_width].
+        """
         _,seq=self.bert(input_ids,attention_mask=attention_mask,token_type_ids=token_type_ids,
                         position_ids=position_ids,head_mask=head_mask,inputs_embeds=inputs_embeds,
                         output_attentions=output_attentions,output_hidden_states=output_hidden_states)
@@ -457,6 +833,25 @@ class CVSGModel(BertPreTrainedModel):
     def forward(self,input_ids,visual,acoustic,label_ids=None,attention_mask=None,
                 token_type_ids=None,position_ids=None,head_mask=None,inputs_embeds=None,
                 labels=None,output_attentions=None,output_hidden_states=None,return_loss=False):
+        """Execute end-to-end multimodal sentiment regression or supervised training.
+
+        Args:
+            input_ids: Text token identifiers.
+            visual, acoustic: Aligned nonverbal feature tensors.
+            label_ids: Training sentiment targets, if available.
+            attention_mask: Text validity mask; defaults to all ones.
+            token_type_ids, position_ids, head_mask: Optional text-encoder options.
+            inputs_embeds: Optional externally supplied token embedding tensors.
+            labels: Alternate name for training labels.
+            output_attentions, output_hidden_states: Text encoder output options.
+            return_loss: Return (predictions, loss) instead of predictions only.
+
+        Returns:
+            Sentiment predictions, or a prediction-and-loss tuple for training.
+
+        No target labels are fed into the feature extraction path. Labels are
+        passed exclusively to the supervised objective when return_loss is true.
+        """
         if attention_mask is None: attention_mask=torch.ones_like(input_ids)
         l,a,v=self._get_features(input_ids,visual,acoustic,attention_mask,token_type_ids,
                 position_ids,head_mask,inputs_embeds,output_attentions,output_hidden_states)
@@ -464,5 +859,10 @@ class CVSGModel(BertPreTrainedModel):
         pred,loss=self.fusion(l,a,v,None,None,None,y if return_loss else None,attention_mask)
         return (pred,loss) if return_loss else pred
     def test(self,input_ids,visual,acoustic,attention_mask=None,token_type_ids=None,**kwargs):
+        """Produce test-time predictions using learned full-view fusion parameters.
+
+        The test interface matches the trainer's evaluation calls. Auxiliary
+        coalition supervision is disabled because no training targets are passed.
+        """
         return self.forward(input_ids,visual,acoustic,None,attention_mask,token_type_ids)
 
