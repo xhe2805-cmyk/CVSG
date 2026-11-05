@@ -24,15 +24,14 @@ CVSG/
 │   ├── multihead_attention.py
 │   └── position_embedding.py
 ├── scripts/
-│   ├── check_dataset.py
-│   └── run_five_seeds.py
+│   └── check_dataset.py
 ├── datasets/
 │   ├── README.md
 │   ├── mosi.pkl                 # Download separately; not included
 │   └── mosei.pkl                # Download separately; not included
 ├── bert-base-uncased/           # Download separately; not included
 ├── checkpoints/                # Created by training
-└── results/                    # Logs and multi-seed summaries
+└── results/                    # Training and evaluation outputs
 ```
 
 ## 1. Environment setup
@@ -153,16 +152,8 @@ The matching checkpoint must be present under `checkpoints/`. To load another ch
 
 Reported metrics include Acc-2, support-weighted F1, Acc-7, MAE, Pearson correlation (Corr), and MSE. By default, Acc-2 and F1 exclude examples whose ground-truth sentiment is exactly zero; `--include_zero` changes this convention.
 
-## 6. Five-seed evaluation
 
-The included script runs seeds `0`, `54`, `58`, `101`, and `2334` by default, and writes per-seed logs and a mean/standard-deviation JSON summary to `results/`.
-
-```bash
-python scripts/run_five_seeds.py --dataset mosi --gpu 0 --n_epochs 50 --bert_path ./bert-base-uncased
-python scripts/run_five_seeds.py --dataset mosei --gpu 0 --n_epochs 50 --train_batch_size 128 --bert_path ./bert-base-uncased
-```
-
-## 7. Available ablation switches
+## 6. Available ablation switches
 
 ```bash
 --disable_coalition             # Remove coalition-based auxiliary objectives
