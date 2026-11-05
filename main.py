@@ -1,4 +1,16 @@
-"""CVSG: training and evaluation with validation-based checkpoint selection."""
+"""CVSG training and evaluation entry point.
+
+This program prepares word-aligned CMU-MOSI or CMU-MOSEI features, loads
+pretrained BERT parameters, and trains the coalition-guided fusion model.
+It uses independent optimizers for text and the remaining network weights.
+Best-checkpoint selection is based on validation-set MSE or MAE, not test
+performance. The final test report is produced after checkpoint restoration.
+
+The same random seed, batch order, tensor operations, data conversion,
+optimizer update cadence, and metric definitions are preserved in this
+documented release. Command-line switches and checkpoint payload keys are
+compatible with the previous project version.
+"""
 import argparse
 from contextlib import contextmanager
 import importlib
@@ -22,6 +34,17 @@ METHOD = 'CVSG'
 
 
 def parse_args(argv=None):
+    """Parse model, training, and evaluation settings from the command line.
+
+    Includes dataset selection, data paths, pretrained language source,
+    optimizer settings, optional training ablations, and evaluation behavior.
+    Original defaults and alternate hyphenated flag spellings are preserved.
+
+    Args:
+        argv: Optional explicit CLI argument list; defaults to sys.argv.
+    Returns:
+        Validated argparse namespace consumed by the training workflow.
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dataset', choices=['mosi', 'mosei'], default='mosi')
     for key, default in {'max_seq_length': 50, 'train_batch_size': 32, 'dev_batch_size': 128,
@@ -83,11 +106,21 @@ def parse_args(argv=None):
 
 
 def root_path(value):
+    """Resolve a user-provided data or checkpoint path relative to project root.
+
+    Absolute paths are preserved. Relative paths are resolved against the
+    directory containing this script so execution is independent of shell cwd.
+    """
     path = Path(value).expanduser()
     return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
 
 
 def choose_device(args):
+    """Select a CPU or CUDA device and validate the optional GPU index.
+
+    The auto setting uses cuda:0 if available. Passing a negative --gpu
+    selects CPU. This routine does not alter network weights or random seeds.
+    """
     name = ('cpu' if args.gpu < 0 else f'cuda:{args.gpu}') if args.gpu is not None else args.device
     if name == 'auto':
         name = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -102,6 +135,11 @@ def choose_device(args):
 
 
 def setup_seed(seed):
+    """Initialize Python, NumPy, and PyTorch random generators for a run.
+
+    CUDA generators are seeded if available. CuDNN benchmarking is disabled
+    and deterministic mode is requested, matching the prior training protocol.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -113,6 +151,11 @@ def setup_seed(seed):
 
 @contextmanager
 def evaluation_rng(seed, device):
+    """Isolate evaluation random-number generation from training RNG state.
+
+    The same seed offset is applied to each evaluation call. torch.random
+    fork_rng restores the caller's state on exit, preserving subsequent draws.
+    """
     devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == 'cuda' else []
     with torch.random.fork_rng(devices=devices):
         torch.random.default_generator.manual_seed(seed)
@@ -123,6 +166,11 @@ def evaluation_rng(seed, device):
 
 
 def read_data(path):
+    """Load a word-aligned sentiment dataset from a Python pickle file.
+
+    The file must contain named train, validation, and test split entries.
+    A missing or malformed path produces an actionable exception.
+    """
     if not path.is_file():
         raise FileNotFoundError('Dataset not found: ' + str(path))
     with path.open('rb') as handle:
@@ -133,6 +181,11 @@ def read_data(path):
 
 
 def get_split(data, name):
+    """Obtain a nonempty dataset split and normalize dev-versus-valid naming.
+
+    The samples must use the supported tuple format; dictionary-shaped records
+    from an incompatible preprocessing pipeline are intentionally rejected.
+    """
     key = 'valid' if name == 'dev' and 'dev' not in data else name
     if key not in data or not len(data[key]):
         raise ValueError('Missing or empty split: ' + name)
@@ -142,6 +195,21 @@ def get_split(data, name):
 
 
 def make_dataset(examples, tokenizer, length, expected_dims=None):
+    """Convert original word-aligned examples into batched model tensors.
+
+    Tokenization expands each word into BERT subword pieces and repeats the
+    corresponding audio and visual feature rows at each expanded position.
+    Special tokens and padding receive zeros in the nonverbal feature tensors.
+    Non-finite audio/visual feature values are converted to zero.
+
+    Args:
+        examples: Iterable of ((words, vision, audio), label, identifier).
+        tokenizer: BERT tokenizer with CLS, SEP, UNK, and padding tokens.
+        length: Fixed sequence length, including special tokens.
+        expected_dims: Optional (audio_width, visual_width) consistency check.
+    Returns:
+        TensorDataset and the observed audio/visual feature widths.
+    """
     ids_all, visuals, acoustics, masks, types, labels = [], [], [], [], [], []
     dims = expected_dims
     for index, example in enumerate(examples):
@@ -188,10 +256,21 @@ def make_dataset(examples, tokenizer, length, expected_dims=None):
 
 
 def loader(dataset, batch_size, shuffle=False):
+    """Build a DataLoader with the original batching and shuffle settings.
+
+    Drop-last remains false, and no extra worker processes are introduced.
+    This retains minibatch membership and order for a given training seed.
+    """
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=False, num_workers=0)
 
 
 def metrics(pred, truth, include_zero=False):
+    """Compute sentiment classification and regression metrics from predictions.
+
+    Binary accuracy and weighted F1 ignore exact-zero labels by default.
+    Seven-class accuracy clips and rounds continuous predictions to [-3, 3].
+    MAE, Pearson correlation, and MSE are computed on the full evaluation split.
+    """
     pred, truth = np.asarray(pred, dtype=np.float64), np.asarray(truth, dtype=np.float64)
     if not len(pred) or pred.shape != truth.shape or not np.isfinite(pred).all() or not np.isfinite(truth).all():
         raise ValueError('Predictions and targets must be finite, matching, nonempty vectors')
@@ -208,11 +287,19 @@ def metrics(pred, truth, include_zero=False):
 
 
 def format_metrics(result):
+    """Format metric values for the final evaluation line.
+
+    Unavailable values display as NA; finite values use four decimal places.
+    """
     return '  '.join(f'{name}=' + ('NA' if value is None else f'{value:.4f}') for name, value in result.items())
 
 
 def format_epoch_line(epoch, split, result):
-    """Fixed-width epoch rows: TRAIN / VAL / TEST / BEST VAL TEST."""
+    """Render a consistent summary row for one dataset split and epoch.
+
+    Displays the classification, regression, and training-objective fields in
+    a stable order. This function affects logging only, never checkpoint choice.
+    """
     result = result or {}
     fields = []
     for key in ('Acc_2', 'F1', 'Acc_7', 'MAE', 'Corr', 'MSE'):
@@ -226,6 +313,13 @@ def format_epoch_line(epoch, split, result):
 
 
 def train_epoch(model, data_loader, optimizers, args, device):
+    """Execute one training epoch with unchanged gradient accumulation semantics.
+
+    Two optimizers update BERT parameters and the remaining model parameters.
+    Gradient scaling accounts for the number of samples in each accumulation
+    group, including the final possibly incomplete group.
+    Batch predictions are collected only to report training-set metrics.
+    """
     model.train()
     for optimizer in optimizers:
         optimizer.zero_grad(set_to_none=True)
@@ -253,6 +347,12 @@ def train_epoch(model, data_loader, optimizers, args, device):
 
 
 def evaluate(model, data_loader, args, device):
+    """Evaluate the model without gradients or parameter updates.
+
+    Isolated evaluation RNG prevents any optional stochastic sampling from
+    changing the subsequent training stream. Outputs are collected in dataset
+    order and passed to the standard sentiment metrics calculator.
+    """
     model.eval()
     predictions, targets = [], []
     with evaluation_rng((args.seed + 9876) % 2**32, device), torch.no_grad():
@@ -265,12 +365,22 @@ def evaluate(model, data_loader, args, device):
 
 
 def tokenizer_files(tokenizer):
+    """Serialize tokenizer metadata into checkpoint-compatible binary entries.
+
+    A temporary directory holds tokenizer files only during serialization.
+    The exact resulting bytes are embedded into the checkpoint payload.
+    """
     with tempfile.TemporaryDirectory(prefix='cvsg-tokenizer-') as directory:
         tokenizer.save_pretrained(directory)
         return {p.name: p.read_bytes() for p in Path(directory).iterdir() if p.is_file()}
 
 
 def load_checkpoint(path):
+    """Load a saved CVSG checkpoint and validate its model identifier.
+
+    A checkpoint from a different model is rejected before state restoration.
+    The saved payload remains otherwise untouched.
+    """
     if not path.is_file():
         raise FileNotFoundError('Checkpoint not found: ' + str(path))
     payload = torch.load(path, map_location='cpu')
@@ -280,6 +390,11 @@ def load_checkpoint(path):
 
 
 def configure_model(dims):
+    """Configure global acoustic and visual feature widths for the selected data.
+
+    Returns the existing model class after verifying that the loaded model file
+    and training entry point agree on their CVSG identifier.
+    """
     global_configs.ACOUSTIC_DIM, global_configs.VISUAL_DIM = dims
     module = importlib.import_module('model')
     if getattr(module, 'MODEL_ID', None) != METHOD:
@@ -289,6 +404,12 @@ def configure_model(dims):
 
 
 def set_training_options(model, settings):
+    """Apply command-line ablation settings to the fusion network.
+
+    Options control coalition, utility, pair, and scale components together
+    with their loss coefficients and evaluation stochasticity. This routine
+    does not create or remove any trainable parameters.
+    """
     model.fusion.configure_training_options(
         disable_coalition=getattr(settings,'disable_coalition',False),
         disable_value=getattr(settings,'disable_value',False),
@@ -307,6 +428,11 @@ def set_training_options(model, settings):
 
 
 def restore(payload, device):
+    """Recreate a model and restore all saved state tensors strictly.
+
+    Uses the checkpoint's recorded feature widths, BERT configuration, and
+    experiment settings, not unrelated new command-line defaults.
+    """
     CVSGModel = configure_model(tuple(payload['feature_dims']))
     old_config = payload['experiment_config']
     multi = SimpleNamespace(beta_shift=old_config['beta_shift'], dropout_prob=old_config['dropout_prob'])
@@ -318,6 +444,11 @@ def restore(payload, device):
 
 
 def restore_tokenizer(payload):
+    """Reconstruct the tokenizer using the files embedded in the checkpoint.
+
+    Rejects unexpected paths that could escape the temporary tokenizer folder.
+    The tokenizer is loaded locally, without requiring a network lookup.
+    """
     with tempfile.TemporaryDirectory(prefix='cvsg-test-tokenizer-') as directory:
         for name, content in payload['tokenizer_files'].items():
             if Path(name).name != name:
@@ -327,6 +458,16 @@ def restore_tokenizer(payload):
 
 
 def fit(model, train_loader, valid_loader, args, tokenizer, dims, device, checkpoint_path, test_loader):
+    """Train the model and retain the minimum-validation-error checkpoint.
+
+    The same original optimizers and learning-rate ratio are used. Checkpoint
+    selection compares only the specified validation MSE or MAE metric.
+    Intermediate test evaluation, when requested, is diagnostic and cannot
+    affect the chosen epoch. Model state and tokenizer files are saved together.
+
+    The final incomplete gradient-accumulation group is handled by train_epoch.
+    This function deliberately does not introduce early stopping or schedulers.
+    """
     bert_parameters = list(model.bert.parameters())
     bert_ids = {id(p) for p in bert_parameters}
     other_parameters = [p for p in model.parameters() if id(p) not in bert_ids]
@@ -372,6 +513,28 @@ def fit(model, train_loader, valid_loader, args, tokenizer, dims, device, checkp
 
 
 def main(argv=None):
+    """Run complete CVSG training/evaluation or checkpoint-only evaluation.
+
+    Training creates the three dataset splits, initializes pretrained text
+    weights, runs all requested epochs, reloads the best validation checkpoint,
+    and evaluates the test set. Evaluation-only mode instead loads the saved
+    tokenizer and model without retraining.
+
+    The test split is never used as the checkpoint-selection criterion.
+    Results and checkpoint paths are reported on standard output.
+
+    Data contract:
+        Each split uses the same tokenizer and feature-dimension checks.
+        BERT subword expansion preserves word-aligned audio/visual rows.
+    Selection contract:
+        Only the configured validation error decides which epoch is saved.
+        Saved parameters are reloaded before final test evaluation.
+        No extra early-stopping condition changes the epoch count.
+    Reproducibility contract:
+        The seed controls Python, NumPy, and PyTorch random streams.
+        Evaluation has a forked RNG context to protect training randomness.
+        The original optimizer grouping and batch traversal are untouched.
+    """
     args = parse_args(argv)
     device = choose_device(args)
     run_tag = 'CVSG' + ''.join('_'+tag for flag,tag in (
